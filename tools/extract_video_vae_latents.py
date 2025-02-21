@@ -112,7 +112,10 @@ class VideoDataset(Dataset):
     def process_one_video(self, video_item):
         videos_per_task = []
         video_path = video_item['video']
-        output_latent_path = video_item['latent']
+        text = video_item['text']
+        output_latent_path = video_path.replace('.mp4', f'-latent-{self.height}.pt')
+        if 'latent' in video_item:
+            output_latent_path = video_item['latent']
 
         # The sampled frame indexs of a video, if not specified, load frames: [0, num_frames)
         frame_indexs = video_item['frames'] if 'frames' in video_item else list(range(self.num_frames))
@@ -131,7 +134,7 @@ class VideoDataset(Dataset):
                 return videos_per_task
 
             video_frames_tensors = video_frames_tensors.unsqueeze(0)
-            videos_per_task.append({'video': video_path, 'input': video_frames_tensors, 'output': output_latent_path})
+            videos_per_task.append({'video': video_path, 'input': video_frames_tensors, 'output': output_latent_path, 'text': text})
 
         except Exception as e:
             print(f"Load video tensor ERROR: {e}")
@@ -162,6 +165,7 @@ def get_args():
     parser.add_argument('--height', type=int, default=384, help="The video height")
     parser.add_argument('--num_frames', type=int, default=121, help="The frame number to encode")
     parser.add_argument('--save_memory', action='store_true', help="Open the VAE tiling")
+    parser.add_argument('--jsonl_out_file', type=str, default='', help="The jsonl file to save the output")
     return parser.parse_args()
 
 
@@ -176,11 +180,13 @@ def build_model(args):
 def build_data_loader(args):
 
     def collate_fn(batch):
-        return_batch = {'input' : [], 'output': []}
+        return_batch = {'video' : [], 'input' : [], 'output': [], 'text': []}
         for videos_ in batch:
             for video_input in videos_:
+                return_batch['video'].append(video_input['video'])
                 return_batch['input'].append(video_input['input'])
                 return_batch['output'].append(video_input['output'])
+                return_batch['text'].append(video_input['text'])
         return return_batch
 
     dataset = VideoDataset(args.anno_file, args.width, args.height, args.num_frames)
@@ -223,6 +229,7 @@ def main():
     window_size = 16
     temporal_chunk = True
     task_queue = []
+    processed_videos = []
 
     if args.save_memory:
         # Open the tiling, to reduce gpu memory cost
@@ -231,17 +238,28 @@ def main():
     with futures.ThreadPoolExecutor(max_workers=16) as executor:
 
         for sample in tqdm(data_loader):
+            video_list = sample['video']
             input_video_list = sample['input']
             output_path_list = sample['output']
+            text_list = sample['text']
 
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch_dtype):
-                for video_input, output_path in zip(input_video_list, output_path_list):
+                for video_path, video_input, output_path, text in zip(video_list, input_video_list, output_path_list, text_list):
                     video_latent = model.encode_latent(video_input.to(device), sample=True, window_size=window_size, temporal_chunk=temporal_chunk, tile_sample_min_size=256)
                     video_latent = video_latent.to(torch_dtype).cpu()
                     task_queue.append(executor.submit(save_tensor, video_latent, output_path))
+                    processed_videos.append({'video': video_path, 'text': text, 'latent': output_path})
         
         for future in futures.as_completed(task_queue):
             res = future.result()
+
+    torch.distributed.barrier()
+    
+    # Only let the main process write the output file
+    if args.rank == 0:
+        with jsonlines.open(args.jsonl_out_file, 'w') as writer:
+            for video in processed_videos:
+                writer.write(video)
 
     torch.distributed.barrier()
 

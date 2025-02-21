@@ -87,7 +87,7 @@ class CausalVideoVAELossWrapper(nn.Module):
             disc_ckpt_load_result = self.loss.discriminator.load_state_dict(disc_checkpoint, strict=False)
             print(f"Load disc checkpoint from {checkpoint_path}, load result: {disc_ckpt_load_result}")
 
-    def forward(self, x, step, identifier=['video']):
+    def forward(self, x, step, identifier=['video'], return_recons=False):
         xdim = x.ndim
         if xdim == 4:
             x = x.unsqueeze(2)   #  (B, C, H, W) -> (B, C, 1, H , W)
@@ -123,7 +123,7 @@ class CausalVideoVAELossWrapper(nn.Module):
         )
 
         if step < self.disc_start:
-            return reconstruct_loss, None, rec_log
+            return (reconstruct_loss, None, rec_log, reconstruct) if return_recons else (reconstruct_loss, None, rec_log)
 
         # The loss to train the discriminator
         gan_loss, gan_log = self.loss(batch_x, reconstruct, posterior, optimizer_idx=1, 
@@ -132,7 +132,7 @@ class CausalVideoVAELossWrapper(nn.Module):
 
         loss_log = {**rec_log, **gan_log}
 
-        return reconstruct_loss, gan_loss, loss_log
+        return (reconstruct_loss, gan_loss, loss_log, reconstruct) if return_recons else (reconstruct_loss, gan_loss, loss_log)
 
     def encode(self, x, sample=False, is_init_image=True, 
             temporal_chunk=False, window_size=16, tile_sample_min_size=256,):

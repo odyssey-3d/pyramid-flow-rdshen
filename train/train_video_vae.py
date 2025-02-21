@@ -10,7 +10,6 @@ import torch.backends.cudnn as cudnn
 import json
 import random
 from pathlib import Path
-from collections import OrderedDict
 
 from dataset import (
     ImageDataset,
@@ -30,11 +29,13 @@ from trainer_misc import (
 
 from video_vae import CausalVideoVAELossWrapper
 
-from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import utils
+
+WANDB_PROJECT = os.environ.get('WANDB_PROJECT', 'world-dynamics-rdshen')
+WANDB_ENTITY = os.environ.get('WANDB_ENTITY', 'odyssey')
 
 
 def get_args():
@@ -139,6 +140,12 @@ def get_args():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
+    parser.add_argument('--report_to', nargs='+', default=[],
+                       choices=['tensorboard', 'wandb'], 
+                       help='Platforms to log to. Can specify multiple.')
+    parser.add_argument('--vis_freq', default=20, type=int, 
+                       help='Frequency of visualization logging')
+
     return parser.parse_args()
 
 
@@ -173,7 +180,56 @@ def build_model(args):
 
 
 def main(args):
+    # Add these debug prints
+    print(f"RANK: {os.environ.get('RANK', 'None')}")
+    print(f"WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'None')}")
+    print(f"LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'None')}")
+    print(f"MASTER_ADDR: {os.environ.get('MASTER_ADDR', 'None')}")
+    print(f"MASTER_PORT: {os.environ.get('MASTER_PORT', 'None')}")
+    
     init_distributed_mode(args)
+
+    # Initialize loggers
+    loggers = {}
+    if utils.is_main_process():
+        if 'tensorboard' in args.report_to:
+            from torch.utils.tensorboard import SummaryWriter
+            loggers['tensorboard'] = SummaryWriter(os.path.join(args.output_dir, "tensorboard"))
+        
+        if 'wandb' in args.report_to:
+            try:
+                import wandb
+                
+                # Force non-interactive mode and disable console output
+                os.environ['WANDB_SILENT'] = 'true'
+                
+                # Initialize wandb without any prompts
+                run = wandb.init(
+                    project=WANDB_PROJECT,
+                    entity=WANDB_ENTITY,
+                    config=vars(args),
+                    settings=wandb.Settings(
+                        _disable_stats=True,
+                        _disable_meta=True,
+                        _service_wait=300
+                    ),
+                    mode="offline" if os.environ.get("WANDB_MODE", "") == "offline" else "online",
+                )
+                
+                loggers['wandb'] = run
+                print(f"Successfully initialized wandb run: {run.name}")
+                
+            except Exception as e:
+                print(f"Failed to initialize wandb: {str(e)}")
+                print("Continuing without wandb logging...")
+                if 'wandb' in args.report_to:
+                    args.report_to.remove('wandb')
+    else:
+        loggers = None
+
+    # Add a barrier after logger initialization
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     # If enabled, distribute multiple video clips to different devices
     if args.use_context_parallel:
@@ -193,11 +249,17 @@ def main(args):
 
     model = build_model(args)
     
+    if utils.is_main_process() and hasattr(model.vae, 'save_config'):
+        try:
+            model.vae.save_config(args.output_dir)
+            print(f"Successfully saved model config to {args.output_dir}")
+        except Exception as e:
+            print(f"Warning: Failed to save model config: {str(e)}")
+    
     world_size = utils.get_world_size()
     global_rank = utils.get_rank()
 
     num_training_steps_per_epoch = args.iters_per_epoch
-    log_writer = None
 
     # building dataset and dataloaders
     image_gpus = max(1, int(world_size * args.image_mix_ratio))
@@ -226,7 +288,9 @@ def main(args):
         use_image_video_mixed_training=args.use_image_video_mixed_training,
     )
     
+    print(f"Process {global_rank}/{world_size} reached barrier")
     torch.distributed.barrier()
+    print(f"Process {global_rank}/{world_size} passed barrier")
 
     model.to(device)
     model_without_ddp = model
@@ -291,7 +355,7 @@ def main(args):
             loss_scaler,
             loss_scaler_disc,
             args.clip_grad, 
-            log_writer=log_writer,
+            loggers=loggers,
             start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values,
             lr_schedule_values_disc=lr_schedule_values_disc,
@@ -311,14 +375,23 @@ def main(args):
                     'epoch': epoch, 'n_parameters': n_learnable_parameters}
 
         if args.output_dir and utils.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
+            if 'tensorboard' in loggers:
+                loggers['tensorboard'].flush()
+            if 'wandb' in loggers:
+                wandb.log(log_stats)
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+
+    # Cleanup loggers
+    if utils.is_main_process():
+        if 'tensorboard' in loggers:
+            loggers['tensorboard'].close()
+        if 'wandb' in loggers:
+            wandb.finish()
 
 
 if __name__ == '__main__':

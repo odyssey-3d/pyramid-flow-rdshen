@@ -5,8 +5,9 @@
 
 GPUS=8  # The gpu number
 MODEL_NAME=pyramid_flux     # The model name, `pyramid_flux` or `pyramid_mmdit`
-MODEL_PATH=/PATH/pyramid-flow-miniflux  # The downloaded ckpt dir. IMPORTANT: It should match with model_name, flux or mmdit (sd3)
-ANNO_FILE=annotation/video_text.jsonl   # The video-text annotation file path
+MODEL_PATH=./pyramid_flow_model/  # The downloaded ckpt dir. IMPORTANT: It should match with model_name, flux or mmdit (sd3)
+ANNO_FILE=/mnt/ssd/datasets/processed_data/video_text_latent.jsonl   # The video-text annotation file path
+JSONL_OUT_FILE=/mnt/ssd/datasets/processed_data/video_text.jsonl
 
 
 torchrun --nproc_per_node $GPUS \
@@ -15,4 +16,5 @@ torchrun --nproc_per_node $GPUS \
     --model_dtype bf16 \
     --model_name $MODEL_NAME \
     --model_path $MODEL_PATH \
-    --anno_file $ANNO_FILE
+    --anno_file $ANNO_FILE \
+    --jsonl_out_file $JSONL_OUT_FILE

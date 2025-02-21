@@ -46,11 +46,20 @@ def get_rank():
 
 def is_main_process():
     return get_rank() == 0
-
-
-def save_on_master(*args, **kwargs):
+        
+        
+def save_on_master_pytorch(*args, **kwargs):
     if is_main_process():
         torch.save(*args, **kwargs)
+
+
+def save_on_master_diffusers(model, save_directory, **kwargs):
+    if is_main_process():
+        try:
+            model.save_pretrained(save_directory, **kwargs)
+            print(f"Successfully saved model in diffusers format to {save_directory}")
+        except Exception as e:
+            print(f"Warning: Failed to save model in diffusers format: {str(e)}")
 
 
 def setup_for_distributed(is_master):
@@ -68,43 +77,24 @@ def setup_for_distributed(is_master):
     __builtin__.print = print
 
 
-def init_distributed_mode(args, init_pytorch_ddp=True):
-    if int(os.getenv('OMPI_COMM_WORLD_SIZE', '0')) > 0:
-        rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
-        local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
-        world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
-
-        os.environ["LOCAL_RANK"] = os.environ['OMPI_COMM_WORLD_LOCAL_RANK']
-        os.environ["RANK"] = os.environ['OMPI_COMM_WORLD_RANK']
-        os.environ["WORLD_SIZE"] = os.environ['OMPI_COMM_WORLD_SIZE']
-
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
-
-    elif 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+def init_distributed_mode(args):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
-
     else:
         print('Not using distributed mode')
         args.distributed = False
         return
 
     args.distributed = True
-    args.dist_backend = 'nccl'
-    args.dist_url = "env://"
-    print('| distributed init (rank {}): {}, gpu {}'.format(
-        args.rank, args.dist_url, args.gpu), flush=True)
-
-    if init_pytorch_ddp:
-        # Init DDP Group, for script without using accelerate framework
-        torch.cuda.set_device(args.gpu)
-        torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                world_size=args.world_size, rank=args.rank, timeout=datetime.timedelta(days=365))
-        torch.distributed.barrier()
-        setup_for_distributed(args.rank == 0)
+    torch.cuda.set_device(args.gpu)
+    args.dist_url = 'env://'
+    torch.distributed.init_process_group(
+        backend='nccl',
+        init_method=args.dist_url,
+        world_size=args.world_size,
+        rank=args.rank)
 
 
 def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, 
@@ -443,6 +433,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, mo
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
 
+    # Save in pytorch format
     checkpoint_paths = [output_dir / 'checkpoint.pth']
     if epoch == 'best':
         checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name),]
@@ -453,7 +444,7 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, mo
         to_save = {
             'model': model_without_ddp.state_dict(),
             'epoch': epoch,
-            'step' : args.global_step,
+            'step': args.global_step,
             'args': args,
         }
 
@@ -469,7 +460,15 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, mo
         if optimizer_disc is not None:
             to_save['optimizer_disc'] = optimizer_disc.state_dict()
 
-        save_on_master(to_save, checkpoint_path)
+        save_on_master_pytorch(to_save, checkpoint_path)
+
+    # Save in diffusers format if the model supports it
+    if hasattr(model_without_ddp, 'vae') and hasattr(model_without_ddp.vae, 'save_pretrained'):
+        save_on_master_diffusers(
+            model_without_ddp.vae,
+            output_dir,
+            safe_serialization=True  # Use safetensors format
+        )
 
 
 def get_grad_norm_(parameters, norm_type: float = 2.0, layer_names=None) -> torch.Tensor:

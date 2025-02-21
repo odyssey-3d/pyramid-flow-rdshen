@@ -636,6 +636,7 @@ class PyramidDiTForVideoGeneration:
         else:
             return diffusion_loss, {}
 
+    # TODO: add support for training off of pre-extracted text embeds
     def __call__(self, video, text, identifier=['video'], use_temporal_pyramid=True, accelerator: Accelerator=None):
         xdim = video.ndim
         device = video.device

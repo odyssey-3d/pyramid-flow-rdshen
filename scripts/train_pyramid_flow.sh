@@ -5,18 +5,20 @@
 # make sure to set, NUM_FRAMES % VIDEO_SYNC_GROUP == 0; GPUS % VIDEO_SYNC_GROUP == 0
 
 GPUS=8  # The gpu number
+# WANDB_API_KEY=  # TODO: fix wandb logging in docker
 SHARD_STRATEGY=zero2   # zero2 or zero3
 VIDEO_SYNC_GROUP=8     # values in [4, 8, 16] The number of process that accepts the same input video, used for temporal pyramid AR training.
 MODEL_NAME=pyramid_flux     # The model name, `pyramid_flux` or `pyramid_mmdit`
-MODEL_PATH=/PATH/pyramid-flow-miniflux  # The downloaded ckpt dir. IMPORTANT: It should match with model_name, flux or mmdit (sd3)
+MODEL_PATH=./pyramid_flow_model/  # The downloaded ckpt dir. IMPORTANT: It should match with model_name, flux or mmdit (sd3)
 VARIANT=diffusion_transformer_384p  # The DiT Variant
-OUTPUT_DIR=/PATH/output_dir    # The checkpoint saving dir
+# VAE_PRETRAINED_WEIGHT=/mnt/ssd/experiments/Pyramid-Flow/output_dir/checkpoint.pth
+OUTPUT_DIR=/mnt/ssd/experiments/Pyramid-Flow/output_dir/dit_384p/    # The checkpoint saving dir
 
 BATCH_SIZE=4    # It should satisfy batch_size % 4 == 0
 GRAD_ACCU_STEPS=2
 RESOLUTION="384p"     # 384p or 768p
 NUM_FRAMES=16         # e.g., 16 for 5s, 32 for 10s
-ANNO_FILE=annotation/video_text.jsonl   # The video annotation file path
+ANNO_FILE=/mnt/ssd/datasets/processed_data/video_text.jsonl   # The video annotation file path
 
 # For the 768p version, make sure to add the args:  --gradient_checkpointing
 
@@ -55,6 +57,13 @@ torchrun --nproc_per_node $GPUS \
     --warmup_steps 1000 \
     --epochs 20 \
     --iters_per_epoch 2000 \
-    --report_to tensorboard \
     --print_freq 40 \
-    --save_ckpt_freq 1
+    --save_ckpt_freq 1 
+    # --report_to wandb \
+    # --resume /mnt/ssd/experiments/Pyramid-Flow/output_dir/dit_384p/ \
+    # --auto_resume
+    # --load_vae \
+    # --vae_pretrained_weight $VAE_PRETRAINED_WEIGHT \
+    # --use_vbench_eval \
+    # --vbench_eval_freq 1 \
+    

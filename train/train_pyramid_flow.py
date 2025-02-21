@@ -73,12 +73,15 @@ import accelerate
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
 from accelerate import FullyShardedDataParallelPlugin
-from diffusers.utils import is_wandb_available
+from diffusers.utils import is_wandb_available, export_to_video
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from diffusers.optimization import get_scheduler
 
 logger = get_logger(__name__)
+
+WANDB_PROJECT = os.environ.get('WANDB_PROJECT', 'world-dynamics-rdshen')
+WANDB_ENTITY = os.environ.get('WANDB_ENTITY', 'odyssey')
 
 
 def get_args():
@@ -178,7 +181,7 @@ def get_args():
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default="wandb",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -208,6 +211,9 @@ def get_args():
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training', type=str)
+
+    parser.add_argument('--use_vbench_eval', action='store_true', help="whether to use VBench evaluation during training")
+    parser.add_argument('--vbench_eval_freq', default=20, type=int, help="number of epochs between VBench evaluations.")
 
     return parser.parse_args()
 
@@ -296,13 +302,121 @@ def build_fsdp_plugin(args):
     return fsdp_plugin
 
 
+def run_vbench_eval(args, runner, epoch, accelerator):
+    """Run VBench evaluation on the current model checkpoint"""
+    # Create evaluation directory
+    eval_dir = os.path.join(args.output_dir, 'vbench_eval')
+    os.makedirs(eval_dir, exist_ok=True)
+
+    # Set up model for inference
+    runner.vae.enable_tiling()
+    
+    # Default prompts from demo notebook
+    text_prompt = "A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors"
+    
+    # Set dimensions based on model variant
+    if args.model_variant == 'diffusion_transformer_384p':
+        width, height = 640, 384
+    else:  # 768p variant
+        width, height = 1280, 768
+    
+    temp = 16  # Default from demo
+
+    # Generate text-to-video sample
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=True if args.model_dtype != 'fp32' else False):
+        t2v_frames = runner.generate(
+            prompt=text_prompt,
+            num_inference_steps=[20, 20, 20],
+            video_num_inference_steps=[10, 10, 10],
+            height=height,
+            width=width,
+            temp=temp,
+            guidance_scale=7.0,
+            video_guidance_scale=5.0,
+            output_type="pil",
+            save_memory=True,
+        )
+    
+    t2v_path = os.path.join(eval_dir, f't2v_sample_epoch_{epoch}.mp4')
+    export_to_video(t2v_frames, t2v_path, fps=24)
+
+    # Generate image-to-video sample
+    image_path = 'assets/the_great_wall.jpg'  # Assuming this exists in project
+    image = Image.open(image_path).convert("RGB")
+    image = image.resize((width, height))
+    
+    i2v_prompt = "FPV flying over the Great Wall"
+    
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=True if args.model_dtype != 'fp32' else False):
+        i2v_frames = runner.generate_i2v(
+            prompt=i2v_prompt,
+            input_image=image,
+            num_inference_steps=[10, 10, 10],
+            temp=temp,
+            guidance_scale=7.0,
+            video_guidance_scale=4.0,
+            output_type="pil",
+            save_memory=True,
+        )
+    
+    i2v_path = os.path.join(eval_dir, f'i2v_sample_epoch_{epoch}.mp4')
+    export_to_video(i2v_frames, i2v_path, fps=24)
+
+    # Run VBench evaluation
+    from vbench import VBench
+    vbench = VBench(
+        device=accelerator.device,
+        full_info_dir="./VBench/vbench/VBench_full_info.json",
+        output_path=eval_dir,
+    )
+
+    # Evaluate supported dimensions for custom input
+    dimensions = [
+        'subject_consistency', 'background_consistency',
+        'motion_smoothness', 'dynamic_degree', 'aesthetic_quality',
+        'imaging_quality'
+    ]
+
+    # Evaluate T2V
+    vbench.evaluate(
+        videos_path=eval_dir,
+        name=f"t2v_epoch_{epoch}",
+        dimension_list=dimensions
+    )
+
+    # Evaluate I2V 
+    vbench.evaluate(
+        videos_path=eval_dir,
+        name=f"i2v_epoch_{epoch}",
+        dimension_list=dimensions
+    )
+
+    # Load and log metrics
+    if accelerator.is_main_process:
+        # Read T2V metrics from json
+        t2v_metrics_path = os.path.join(eval_dir, f"t2v_epoch_{epoch}_eval_results.json")
+        with open(t2v_metrics_path) as f:
+            t2v_metrics = json.load(f)
+            
+        # Read I2V metrics from json
+        i2v_metrics_path = os.path.join(eval_dir, f"i2v_epoch_{epoch}_eval_results.json") 
+        with open(i2v_metrics_path) as f:
+            i2v_metrics = json.load(f)
+
+        # Log metrics
+        for dim, score in t2v_metrics.items():
+            accelerator.log({"vbench/t2v_" + dim: score}, step=epoch)
+        for dim, score in i2v_metrics.items():
+            accelerator.log({"vbench/i2v_" + dim: score}, step=epoch)
+
+
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     # Initialize the Environment variables throught MPI run
-    init_distributed_mode(args, init_pytorch_ddp=False)   # set `init_pytorch_ddp` to False, since the accelerate will do later
+    init_distributed_mode(args)
 
     if args.use_fsdp:
         fsdp_plugin = build_fsdp_plugin(args)
@@ -540,7 +654,19 @@ def main(args):
         model_ema.to(device)
 
     if accelerator.is_main_process:
-        accelerator.init_trackers(os.path.basename(args.output_dir), config=vars(args))
+        accelerator.init_trackers(
+            project_name=WANDB_PROJECT,
+            config=vars(args),
+            init_kwargs={
+                "wandb": {
+                    "entity": WANDB_ENTITY,
+                    "name": f"run-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                    "settings": wandb.Settings(
+                        _service_wait=300  # Prevent alert spam by waiting 5 minutes between similar alerts
+                    )
+                }
+            }
+        )
 
     # Report the training info
     total_batch_size = args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -587,6 +713,10 @@ def main(args):
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path, safe_serialization=False)
                     logger.info(f"Saved state to {save_path}")
+
+            # Run VBench evaluation if enabled
+            if args.use_vbench_eval and epoch % args.vbench_eval_freq == 0:
+                run_vbench_eval(args, runner, epoch, accelerator)
 
             accelerator.wait_for_everyone()
 

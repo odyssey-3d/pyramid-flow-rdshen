@@ -6,11 +6,14 @@
 # Stage-2: pure video training, using context parallel to load video with more video frames (up to 257 frames)
 
 GPUS=8  # The gpu number
-VAE_MODEL_PATH=PATH/vae_ckpt   # The vae model dir
+# WANDB_API_KEY=  # TODO: fix wandb logging in docker
+VAE_MODEL_PATH=./pyramid_flow_model/causal_video_vae/   # The vae model dir
 LPIPS_CKPT=vgg_lpips.pth    # The LPIPS VGG CKPT path, used for calculating the lpips loss
-OUTPUT_DIR=/PATH/output_dir    # The checkpoint saving dir
-IMAGE_ANNO=annotation/image_text.jsonl   # The image annotation file path
-VIDEO_ANNO=annotation/video_text.jsonl   # The video annotation file path
+OUTPUT_DIR=/mnt/ssd/experiments/Pyramid-Flow/output_dir    # The checkpoint saving dir
+# IMAGE_ANNO=annotation/image_text.jsonl   # The image annotation file path
+# VIDEO_ANNO=annotation/video_text.jsonl   # The video annotation file path
+IMAGE_ANNO=/mnt/ssd/datasets/processed_data/image.jsonl
+VIDEO_ANNO=/mnt/ssd/datasets/processed_data/video.jsonl
 RESOLUTION=256     # The training resolution, default is 256
 NUM_FRAMES=17     # x * 8 + 1, the number of video frames
 BATCH_SIZE=2  
@@ -47,13 +50,14 @@ torchrun --nproc_per_node $GPUS \
     --epochs 100 \
     --iters_per_epoch 2000 \
     --print_freq 40 \
+    --vis_freq 20 \
     --save_ckpt_freq 1
 
 
 # Stage-2
 CONTEXT_SIZE=2  # context parallel size, GPUS % CONTEXT_SIZE == 0
 NUM_FRAMES=33   # 17 * CONTEXT_SIZE + 1
-VAE_CKPT_PATH=stage1_path   # The stage-1 trained ckpt
+VAE_CKPT_PATH=/mnt/ssd/experiments/Pyramid-Flow/output_dir/checkpoint.pth   # The stage-1 trained ckpt
 
 torchrun --nproc_per_node $GPUS \
     train/train_video_vae.py \
@@ -86,4 +90,5 @@ torchrun --nproc_per_node $GPUS \
     --epochs 100 \
     --iters_per_epoch 2000 \
     --print_freq 40 \
+    --vis_freq 20 \
     --save_ckpt_freq 1

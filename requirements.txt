@@ -27,3 +27,5 @@ torchmetrics
 tiktoken
 jsonlines
 tensorboardX
+wandb
+jsonlines

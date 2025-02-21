@@ -117,3 +117,7 @@ venv.bak/
 dmypy.json
 .bak
 
+# data and checkpoints
+wandb/
+pyramid_flow_model/
+*.pth
